@@ -1,0 +1,37 @@
+# ---- secrets -------------------------------------------------
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# ---- local databases and caches (rebuilt automatically) --------------------
+chroma*/
+**/chroma_db/
+*.sqlite
+*.sqlite3
+
+# ---- user data: uploaded contracts and chats stay private ------------------
+data/uploads/
+data/chats/
+
+# ---- evaluation: dataset is downloaded separately, results are generated ----
+data/contract-nli/
+eval/results/
+eval/contractnli_questions.json
+
+# ---- editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+__MACOSX/

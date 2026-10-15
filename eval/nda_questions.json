@@ -1,0 +1,27 @@
+{
+  "document": "Mutual Non-Disclosure Agreement (sample)",
+  "note": "expected_sections: section numbers as strings; \"intro\" = text before section 1 (parties, date, purpose)",
+  "questions": [
+    {"id": 1,  "type": "direct",       "question": "Who are the parties to this agreement?", "answerable": true, "expected_sections": ["intro"], "expected_answer": "Party A Corporation and Party B Industries."},
+    {"id": 2,  "type": "direct",       "question": "When does the agreement take effect?", "answerable": true, "expected_sections": ["intro"], "expected_answer": "October 8, 2026 (the Effective Date)."},
+    {"id": 3,  "type": "direct",       "question": "Why are the parties sharing information?", "answerable": true, "expected_sections": ["intro"], "expected_answer": "To evaluate a potential business relationship or transaction (the Purpose)."},
+    {"id": 4,  "type": "paraphrase",   "question": "Where is Party B located?", "answerable": true, "expected_sections": ["intro"], "expected_answer": "456 Enterprise Drive, Innovation District, NY 10001."},
+    {"id": 5,  "type": "direct",       "question": "What counts as confidential information?", "answerable": true, "expected_sections": ["1"], "expected_answer": "Proprietary information, technical data, trade secrets or know-how disclosed by one party that is marked confidential or should reasonably be understood as confidential."},
+    {"id": 6,  "type": "paraphrase",   "question": "Does something told to me verbally also count as confidential?", "answerable": true, "expected_sections": ["1"], "expected_answer": "Yes, information disclosed orally is included."},
+    {"id": 7,  "type": "direct",       "question": "Who am I allowed to share confidential information with?", "answerable": true, "expected_sections": ["2"], "expected_answer": "Only employees, directors or advisors with a need to know who are bound by similar confidentiality obligations."},
+    {"id": 8,  "type": "paraphrase",   "question": "Can I tell my friend about the project?", "answerable": true, "expected_sections": ["2"], "expected_answer": "No; only employees, directors or advisors with a need to know may receive it."},
+    {"id": 9,  "type": "paraphrase",   "question": "Can I use the information for my own side project?", "answerable": true, "expected_sections": ["2"], "expected_answer": "No; it may be used only for the business Purpose."},
+    {"id": 10, "type": "direct",       "question": "How carefully do I have to protect the information?", "answerable": true, "expected_sections": ["2"], "expected_answer": "With at least the same care as its own confidential information, and never less than reasonable care."},
+    {"id": 11, "type": "direct",       "question": "What information is not considered confidential?", "answerable": true, "expected_sections": ["3"], "expected_answer": "Public information, information already lawfully held, information received from a third party without restriction, or independently developed information."},
+    {"id": 12, "type": "paraphrase",   "question": "If the information is already on the internet, do I still have to keep it secret?", "answerable": true, "expected_sections": ["3"], "expected_answer": "No; publicly known information is excluded."},
+    {"id": 13, "type": "paraphrase",   "question": "What if I came up with the same idea myself?", "answerable": true, "expected_sections": ["3"], "expected_answer": "Independently developed information is excluded."},
+    {"id": 14, "type": "direct",       "question": "How long do I have to keep the information secret?", "answerable": true, "expected_sections": ["4"], "expected_answer": "Three years from the date of disclosure, or until released in writing."},
+    {"id": 15, "type": "paraphrase",   "question": "Can I terminate?", "answerable": true, "expected_sections": ["4"], "expected_answer": "There is no early termination right; confidentiality lasts 3 years or until a written release."},
+    {"id": 16, "type": "paraphrase",   "question": "Can the other side free me from the secrecy duty early?", "answerable": true, "expected_sections": ["4"], "expected_answer": "Yes, the Disclosing Party can release the Receiving Party in writing."},
+    {"id": 17, "type": "unanswerable", "question": "What is the penalty if someone breaks this agreement?", "answerable": false, "expected_sections": []},
+    {"id": 18, "type": "unanswerable", "question": "Which state's law governs this agreement?", "answerable": false, "expected_sections": []},
+    {"id": 19, "type": "unanswerable", "question": "Do I have to return the documents when it ends?", "answerable": false, "expected_sections": []},
+    {"id": 20, "type": "unanswerable", "question": "Can I transfer this agreement to another company?", "answerable": false, "expected_sections": []},
+    {"id": 21, "type": "unanswerable", "question": "Is there a non-compete clause?", "answerable": false, "expected_sections": []}
+  ]
+}
