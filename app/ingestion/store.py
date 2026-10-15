@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-import chromadb  # pip install chromadb
 import numpy as np
 
 from app.ingestion.chunker import Chunk
@@ -18,6 +17,14 @@ from app.ingestion.chunker import Chunk
 class VectorStore:
     def __init__(self, path: str = "./chroma_db", collection: str = "legal_chunks",
                  embedding_model: str = "unknown"):
+        # chromadb is imported here, not at the top, so the app can run without it
+        # when it uses Supabase (e.g. on Streamlit Cloud). Locally: pip install chromadb
+        try:
+            import chromadb
+        except ImportError as e:
+            raise RuntimeError(
+                "Local storage needs chromadb (pip install chromadb). On Streamlit Cloud this "
+                "means SUPABASE_URL / SUPABASE_KEY are missing from the app's Secrets.") from e
         self.client = chromadb.PersistentClient(path=path)
         self.col = self.client.get_or_create_collection(
             name=collection,
