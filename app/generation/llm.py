@@ -14,6 +14,19 @@ from __future__ import annotations
 
 import os
 
+def _setting(name: str) -> str | None:
+    """Environment variable (.env locally) first, then Streamlit secrets (Streamlit Cloud)."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        import streamlit as st
+        value = st.secrets.get(name)
+        return str(value) if value else None
+    except Exception:
+        return None
+
+
 PROVIDERS = {
     #  name      default model           base_url                          env var with the key
     "groq":   ("openai/gpt-oss-20b",  "https://api.groq.com/openai/v1",   "GROQ_API_KEY"),
@@ -39,7 +52,7 @@ class LLM:
         if self._client is None:
             from openai import OpenAI
             if self.key_env:
-                api_key = os.environ.get(self.key_env)
+                api_key = _setting(self.key_env)
                 if not api_key:
                     raise RuntimeError(f"{self.key_env} is not set. "
                                        f"Run: export {self.key_env}=your_key")
