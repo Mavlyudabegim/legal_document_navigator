@@ -22,15 +22,18 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 from rank_bm25 import BM25Okapi  # pip install rank-bm25
 
 from app.ingestion.embedder import Embedder
-from app.ingestion.store import VectorStore
+
+if TYPE_CHECKING:                     # only for type hints: Chroma isn't needed with Supabase
+    from app.ingestion.store import VectorStore
 
 try:
-    from nltk.stem import PorterStemmer   # pip install nltk  ("parties" and "party" -> "parti")
+    from nltk.stem import PorterStemmer  # pip install nltk  ("parties" and "party" -> "parti")
     _stem = PorterStemmer().stem
 except ImportError:
     def _stem(w: str) -> str:

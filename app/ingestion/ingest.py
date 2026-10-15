@@ -1,8 +1,8 @@
 """
 ingest.py  —  Pipeline A: PDF -> parse -> chunk -> embed -> store
 
-    python ingest.py contract.pdf
-    python ingest.py contract.pdf --doc-id lease-2027 --backend openai --model text-embedding-3-small
+    python -m app.ingestion.ingest contract.pdf
+    python -m app.ingestion.ingest contract.pdf --doc-id lease-2027 --backend openai --model text-embedding-3-small
 """
 import argparse
 import os
@@ -11,10 +11,10 @@ import time
 from app.ingestion.chunker import chunk_elements
 from app.ingestion.embedder import Embedder
 from app.ingestion.parser import parse_pdf
-from app.ingestion.store import VectorStore
 
 
-def ingest(pdf: str, doc_id: str, embedder: Embedder, store: VectorStore, verbose=True):
+def ingest(pdf: str, doc_id: str, embedder: Embedder, store, verbose=True):
+    """store = VectorStore (Chroma, local) or SupabaseVectorStore (cloud): same methods."""
     t0 = time.time()
     elements = parse_pdf(pdf)
     title = elements[0].text if elements and elements[0].level == 0 else os.path.basename(pdf)
@@ -41,6 +41,7 @@ if __name__ == "__main__":
     ap.add_argument("--model", default="BAAI/bge-small-en-v1.5")
     ap.add_argument("--db", default="./chroma_db")
     a = ap.parse_args()
+    from app.ingestion.store import VectorStore  # Chroma: only needed for this command
     emb = Embedder(model=a.model, backend=a.backend)
     st = VectorStore(a.db, embedding_model=f"{a.backend}:{a.model}")
     ingest(a.pdf, a.doc_id or os.path.splitext(os.path.basename(a.pdf))[0], emb, st)
