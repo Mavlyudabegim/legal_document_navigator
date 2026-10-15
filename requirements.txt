@@ -1,0 +1,13 @@
+# What the web app needs (Streamlit Community Cloud installs this file).
+# CPU-only PyTorch: the default Linux build includes CUDA (~2 GB) and won't fit on free hosting.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+streamlit>=1.45
+python-dotenv
+pymupdf
+numpy
+sentence-transformers
+rank-bm25
+nltk
+openai
+supabase
