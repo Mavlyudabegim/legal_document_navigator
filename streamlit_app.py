@@ -1,80 +1,50 @@
 """
 streamlit_app.py  —  web interface for Legal Document Navigator
 
-    pip install streamlit python-dotenv
     streamlit run streamlit_app.py
 
 Layout
-    sidebar : upload a PDF, pick the active document, settings
+    sidebar : add PDFs, open or delete your documents
     left    : chat — answers with clickable citations
-    right   : source viewer — the cited PDF page with the clause highlighted
+    right   : the PDF, with the sentences the answer used highlighted
 
-Nothing about RAG is new here: upload calls ingest(), each question calls answer_question().
-The UI only displays what the pipeline returns.
+Nothing about RAG happens here: an upload calls ingest(), each question calls answer_question().
+Helpers for the page live in app/ui/, settings in app/config.py, storage in app/storage/.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import re
-from pathlib import Path
 
-import numpy as np
-import pymupdf
-from rank_bm25 import BM25Okapi
 import streamlit as st
 
-try:                                    # reads GROQ_API_KEY etc. from .env
+# 1) secrets first: .env locally, st.secrets on Streamlit Cloud -> environment variables
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+try:
+    for _k, _v in st.secrets.items():
+        if isinstance(_v, str):
+            os.environ.setdefault(_k, _v)
+except Exception:                       # no secrets.toml: fine when running locally
+    pass
 
-from app.generation.llm import LLM, PROVIDERS
-from app.generation.qa import answer_question
-from app.ingestion.chunker import split_sentences
-from app.ingestion.embedder import Embedder
-from app.ingestion.ingest import ingest
-from app.storage import get_storage
-from app.retrieval.retriever import Retriever, Source, tokenize
-
-DB_PATH = "./chroma_db"
-EMB_BACKEND = os.environ.get("EMB_BACKEND", "local")          # must match how you ingested
-EMB_MODEL = os.environ.get("EMB_MODEL", "BAAI/bge-small-en-v1.5")
+from app import config  # noqa: E402  (must come after the secrets are loaded)
+from app.generation.llm import LLM, PROVIDERS  # noqa: E402
+from app.generation.qa import answer_question  # noqa: E402
+from app.ingestion.embedder import Embedder  # noqa: E402
+from app.ingestion.ingest import ingest  # noqa: E402
+from app.retrieval.retriever import Retriever  # noqa: E402
+from app.storage import get_storage  # noqa: E402
+from app.ui import chat_io  # noqa: E402
+from app.ui.highlight import citation_query, key_sentences, page_count, render_page  # noqa: E402
+from app.ui.identity import browser_id  # noqa: E402
+from app.ui.styles import CSS  # noqa: E402
+from app.ui.text import display_name, make_doc_id, md_safe, strip_label  # noqa: E402
 
 st.set_page_config(page_title="Legal Document Navigator", page_icon="⚖️", layout="wide")
-
-# The page itself must not scroll, otherwise the PDF moves with it. So the chat and the PDF
-# each get their own scroll box, as tall as the window minus the title and the input bar.
-# (st.container(key="chat-box") gets the CSS class "st-key-chat-box".)
-st.markdown("""
-<style>
-:root {
-    --chat-top: 22rem;      /* above + below the chat box: title, caption, input bar */
-    --viewer-top: 19.5rem;    /* above + below the PDF box: page buttons, hint line, input bar */
-}
-[data-testid="stMainBlockContainer"] { padding-top: 2.5rem; padding-bottom: 0; }
-h1 { font-size: 1.9rem !important; padding-top: 0 !important; }
-div[data-testid="stLayoutWrapper"]:has(> .st-key-chat-box), .st-key-chat-box {
-    flex: 0 0 calc(100vh - var(--chat-top)) !important;
-    height: calc(100vh - var(--chat-top)) !important;
-}
-div[data-testid="stLayoutWrapper"]:has(> .st-key-pdf-viewer), .st-key-pdf-viewer {
-    flex: 0 0 calc(100vh - var(--viewer-top)) !important;
-    height: calc(100vh - var(--viewer-top)) !important;
-}
-/* whole PDF page visible: as tall as the box allows, never wider than the column */
-.st-key-pdf-viewer img {
-    max-height: calc(100vh - var(--viewer-top) - 0.5rem);
-    max-width: 100%;
-    width: auto !important;
-    object-fit: contain;
-    display: block;
-    margin: 0 auto;
-}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(CSS, unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------ shared objects
@@ -82,14 +52,14 @@ div[data-testid="stLayoutWrapper"]:has(> .st-key-pdf-viewer), .st-key-pdf-viewer
 @st.cache_resource
 def get_embedder() -> Embedder:
     # cache_path=None: SQLite connections can't be shared between Streamlit's threads
-    return Embedder(model=EMB_MODEL, backend=EMB_BACKEND, cache_path=None)
+    return Embedder(model=config.EMB_MODEL, backend=config.EMB_BACKEND, cache_path=None)
 
 
 @st.cache_resource
 def get_store_and_files():
-    """Supabase if SUPABASE_URL + SUPABASE_KEY are in .env, otherwise Chroma + data/ folders.
+    """Supabase if SUPABASE_URL + SUPABASE_KEY are set, otherwise Chroma + data/ folders.
     store = chunks + vectors, files = PDFs, file names and chats (see app/storage/)."""
-    return get_storage(DB_PATH, embedding_model=f"{EMB_BACKEND}:{EMB_MODEL}")
+    return get_storage(config.CHROMA_PATH, embedding_model=f"{config.EMB_BACKEND}:{config.EMB_MODEL}")
 
 
 @st.cache_resource
@@ -105,103 +75,17 @@ def get_llm(provider: str, model: str, thinking: str) -> LLM:
 
 
 # ------------------------------------------------------------------ helpers
-def list_documents(store) -> list[str]:
-    """Your uploaded documents (the ContractNLI evaluation NDAs, 'cnli-…', are hidden)."""
-    return [d for d in store.list_doc_ids() if not d.startswith("cnli-")]
-
-
-def make_doc_id(filename: str, data: bytes) -> str:
-    """'My Lease (final).pdf' -> 'my-lease-final-3fa9c1'. The hash part means the same
-    file is never ingested twice, and two different files with one name don't clash."""
-    stem = re.sub(r"[^a-z0-9]+", "-", Path(filename).stem.lower()).strip("-")[:40] or "doc"
-    return f"{stem}-{hashlib.sha1(data).hexdigest()[:6]}"
-
-
-def display_name(doc_id: str, names: dict) -> str:
-    """Original file name if we know it, else the id without the hash: 'legal-document-sample'."""
-    return names.get(doc_id) or re.sub(r"-[0-9a-f]{6}$", "", doc_id)
+def list_documents() -> list[str]:
+    """Documents uploaded from THIS browser (evaluation NDAs, 'cnli-…', are hidden)."""
+    return [d for d in files.doc_ids(owner) if not d.startswith("cnli-")]
 
 
 def delete_document(doc_id: str) -> None:
-    """Remove a document everywhere: its chunks, the PDF, its chat, its name."""
-    store.delete_document(doc_id)
-    files.delete(doc_id)
+    """Remove a document everywhere: its chunks, the PDF, its chat, its name.
+    files.delete() checks the owner first, so a browser can only delete its own documents."""
+    if files.delete(doc_id, owner):
+        store.delete_document(doc_id)
     state["history"].pop(doc_id, None)
-
-
-def pdf_path_for(doc_id: str) -> Path | None:
-    """A local path PyMuPDF can open (with Supabase: downloaded once into a temp folder)."""
-    return files.pdf_path(doc_id)
-
-
-@st.cache_data(show_spinner=False)
-def page_count(pdf_path: str) -> int:
-    with pymupdf.open(pdf_path) as doc:
-        return doc.page_count
-
-
-@st.cache_data(show_spinner=False)
-def render_page(pdf_path: str, page_no: int, phrases: tuple[str, ...] = (), zoom: float = 1.6) -> bytes:
-    """Render one PDF page as an image, with the given phrases highlighted in yellow.
-    phrases = ()  -> plain page (just uploaded, nothing asked yet)
-
-    For each phrase we first look for the whole sentence on the page. If the parser changed
-    the text a little (line breaks, spaces), we fall back to 6-word pieces, but only use a
-    piece that appears ONCE on the page; common pieces like "of the Receiving Party" would
-    otherwise light up the wrong lines."""
-    with pymupdf.open(pdf_path) as doc:
-        page = doc[page_no - 1]
-        for phrase in phrases:
-            quads = page.search_for(phrase, quads=True)
-            if not quads:
-                words = phrase.split()
-                for i in range(0, max(len(words) - 2, 1), 6):
-                    hits = page.search_for(" ".join(words[i:i + 6]), quads=True)
-                    if len(hits) == 1:
-                        quads += hits
-            for quad in quads:
-                page.add_highlight_annot(quad)
-        return page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom)).tobytes("png")
-
-
-def _pieces(clause: str) -> list[str]:
-    """Clause -> sentences. Very long sentences (legal lists) are cut further at ';', ':'
-    and list markers like (a), (ii), so we can highlight just the relevant item."""
-    out = []
-    bullets = [b for b in re.split(r"\s*[•▪●◦]\s*", clause) if b.strip()]   # one bullet = one item
-    for sent in (x for b in bullets for x in split_sentences(b)):
-        if len(sent.split()) > 40:
-            out += [p.strip() for p in re.split(r"(?<=[;:])\s+|\s+(?=\([a-z0-9]{1,4}\)\s)", sent)]
-        else:
-            out.append(sent.strip())
-    return [p for p in out if len(p.split()) >= 4]
-
-
-@st.cache_data(show_spinner=False)
-def key_sentences(query: str, clause: str, max_n: int = 2) -> tuple[str, ...]:
-    """The 1-2 sentences of a clause that best match the question + the answer sentence
-    that cited it. Score = meaning (embedding cosine) + shared rare words (BM25)."""
-    sents = _pieces(clause)
-    if not query.strip():
-        return (clause,)                                   # nothing to compare with
-    if len(sents) <= 1:
-        return tuple(sents) or (clause,)
-    cos = embedder.embed_documents(sents) @ embedder.embed_query(query)
-    # BM25 inside this one clause: words that appear in every sentence ("Party",
-    # "Confidential Information") count little, rare shared words ("employees") count a lot
-    bm = BM25Okapi([tokenize(t) or ["_"] for t in sents]).get_scores(tokenize(query))
-    score = cos + 0.5 * (bm / bm.max() if bm.max() > 0 else bm)
-    best = score.max()
-    keep = [i for i in np.argsort(-score)[:max_n] if score[i] >= best - 0.05]
-    return tuple(sents[i] for i in sorted(keep))          # keep reading order
-
-
-def citation_query(question: str, answer: str, n: int) -> str:
-    """What to look for inside cited clause [n]: the question plus the answer sentence(s)
-    that carry the [n] marker (they say what the clause was used for)."""
-    parts = re.split(r"(?<=[.!?])\s+", answer)
-    citing = [re.sub(r"\[\d+\]", "", p) for p in parts if f"[{n}]" in p]
-    return " ".join([question] + citing)
 
 
 def show_citation(doc_id: str, src, query: str = "") -> None:
@@ -210,62 +94,25 @@ def show_citation(doc_id: str, src, query: str = "") -> None:
     state[f"page-{doc_id}"] = src.page_start
 
 
-_LABEL = re.compile(r"^\s*[*_]*\s*(yes|no|partly)\s*[.,:!]?\s*[*_]*\s*", re.IGNORECASE)
-
-
-def strip_label(text: str) -> str:
-    """Remove the 'Yes.' / 'No.' / 'Partly.' the prompt puts at the start of every answer.
-    The model still writes it (the evaluation grades answers by it, see prompts.py rule 10);
-    we just don't show it. 'No' as a real first word ("No party may...") is kept, because
-    we only strip it when it is followed by punctuation."""
-    m = _LABEL.match(text)
-    if not m or not re.match(r"^\s*[*_]*\s*(yes|no|partly)\s*[*_]*\s*[.,:!]", text, re.IGNORECASE):
-        return text
-    rest = text[m.end():]
-    return rest[:1].upper() + rest[1:] if rest else text
-
-
-def md_safe(text: str) -> str:
-    """Streamlit treats $...$ as maths; escape dollar signs in contract text."""
-    return text.replace("$", r"\$")
-
-
-def _src_to_dict(s: Source) -> dict:
-    return dict(s.__dict__)
-
-
 def save_chat(doc_id: str, messages: list[dict]) -> None:
-    """Save one document's chat (Source objects -> plain dicts, so it can be stored as JSON)."""
-    out = []
-    for m in messages:
-        m = dict(m)
-        m["citations"] = [_src_to_dict(c) for c in m.get("citations", [])]
-        if m.get("debug"):
-            m["debug"] = {**m["debug"], "hits": [_src_to_dict(c) for c in m["debug"]["hits"]]}
-        out.append(m)
-    files.save_chat(doc_id, out)
+    files.save_chat(doc_id, chat_io.to_json(messages))
 
 
 def load_chat(doc_id: str) -> list[dict]:
     try:
-        messages = files.load_chat(doc_id)
+        return chat_io.from_json(files.load_chat(doc_id))
     except Exception:                       # e.g. no internet: start with an empty chat
         return []
-    for m in messages:
-        m["citations"] = [Source(**c) for c in m.get("citations", [])]
-        if m.get("debug"):
-            m["debug"]["hits"] = [Source(**c) for c in m["debug"]["hits"]]
-    return messages
 
 
 def ingest_upload(up) -> str | None:
     """Save + index one uploaded PDF. Returns its doc_id, or None if it could not be read."""
     data = up.getvalue()
-    doc_id = make_doc_id(up.name, data)
+    doc_id = make_doc_id(up.name, data, owner)
     if doc_id in state["failed"]:
         return None
     if store.count(doc_id) == 0:                     # not indexed yet
-        files.set_name(doc_id, up.name)
+        files.set_name(doc_id, up.name, owner)
         path = files.save_pdf(doc_id, data)          # local folder or Supabase Storage
         with st.status(f"Reading {up.name}…", expanded=True) as status:
             st.write("Parsing, splitting into clauses, embedding…")
@@ -276,7 +123,7 @@ def ingest_upload(up) -> str | None:
                 status.update(label=f"Could not read {up.name}", state="error")
                 st.error(str(e))
                 state["failed"].add(doc_id)
-                files.delete(doc_id)                 # don't keep a half-saved document
+                files.delete(doc_id, owner)          # don't keep a half-saved document
                 return None
     return doc_id
 
@@ -285,6 +132,7 @@ def ingest_upload(up) -> str | None:
 store, files = get_store_and_files()
 embedder = get_embedder()
 state = st.session_state
+owner = browser_id()                     # each browser has its own private list of documents
 state.setdefault("history", {})          # doc_id -> list of messages
 state.setdefault("selected", None)       # the citation shown in the viewer
 
@@ -307,14 +155,14 @@ with st.sidebar:
         state["uploader_key"] += 1
         st.rerun()
 
-    docs = list_documents(store)
+    docs = list_documents()
     if "doc_picker" not in state:                    # first run / after a browser refresh:
         state["doc_picker"] = st.query_params.get("doc")   # reopen the document from the URL
     if state.get("doc_picker") not in docs:
         state["doc_picker"] = None                   # None = nothing open, nothing shown
 
     # Your documents: click a name to open it, the bin to delete it
-    names = files.names()
+    names = files.names(owner)
     for d in docs:
         name_col, del_col = st.columns([5, 1], gap="small", vertical_alignment="center")
         is_open = d == state["doc_picker"]
@@ -354,15 +202,14 @@ with st.sidebar:
     elif "doc" in st.query_params:
         del st.query_params["doc"]
 
-    # No settings for users: the app always uses the best setup from our evaluation
-    # (Groq gpt-oss-20b, hybrid search, top-5 clauses, no reranker, no minimum score).
+    # No settings for users: the app always uses the best setup from the evaluation (app/config.py).
     # Developers can still change things: start the app with  DEV_MODE=1 streamlit run streamlit_app.py
-    provider, model, thinking = "groq", "", "default"
-    k, mode, use_rerank, min_score, show_debug = 5, "hybrid", False, 0.0, False
-    if os.environ.get("DEV_MODE") == "1":
+    provider, model, thinking = config.LLM_PROVIDER, "", "default"
+    k, mode, use_rerank, min_score, show_debug = config.TOP_K, config.SEARCH_MODE, False, 0.0, False
+    if config.DEV_MODE:
         with st.expander("Developer settings"):
             providers = list(PROVIDERS)
-            provider = st.selectbox("LLM provider", providers, index=providers.index("groq"))
+            provider = st.selectbox("LLM provider", providers, index=providers.index(provider))
             model = st.text_input("Model", placeholder=PROVIDERS[provider][0])
             thinking = st.selectbox("Thinking", ["default", "low", "medium", "high"])
             k = st.slider("Clauses to retrieve (k)", 1, 10, 5)
@@ -390,7 +237,7 @@ if not doc_id:
 # cache_resource keeps the retriever (and its BM25 index) between reruns
 @st.cache_resource
 def get_retriever(k: int, min_score: float, mode: str, use_rerank: bool) -> Retriever:
-    reranker = get_reranker("cross-encoder/ms-marco-MiniLM-L-6-v2") if use_rerank else None
+    reranker = get_reranker(config.RERANKER_MODEL) if use_rerank else None
     return Retriever(embedder, store, k=k, min_score=min_score, mode=mode, reranker=reranker)
 
 
@@ -462,11 +309,11 @@ if question:
 # Always shows the PDF. Before any question: plain pages you can flip through.
 # After a question (or a click on [1], [2] ...): jumps to the cited page and highlights the clause.
 with view_col:
-    pdf = pdf_path_for(doc_id)
+    pdf = files.pdf_path(doc_id)          # local path (Supabase: downloaded once to a temp folder)
     sel = state.get("selected")
     src = sel["source"] if sel and sel["doc_id"] == doc_id else None
     # only the most relevant 1-2 sentences of the cited clause get highlighted
-    highlights = key_sentences(sel.get("query") or "", src.text) if src is not None else ()
+    highlights = key_sentences(sel.get("query") or "", src.text, embedder) if src is not None else ()
     on_page = False
 
     if pdf:

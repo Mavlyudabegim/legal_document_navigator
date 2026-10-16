@@ -4,7 +4,7 @@ supabase_store.py  —  keep everything in the cloud (Supabase) instead of on th
     pip install supabase
     .env:  SUPABASE_URL=https://<project>.supabase.co
            SUPABASE_KEY=<secret key>          (never commit this)
-    tables + bucket: run supabase_setup.sql once in the Supabase SQL Editor
+    tables + bucket: run supabase/setup.sql once in the Supabase SQL Editor
 
 Where things go:
     documents table   one row per PDF: doc_id + original file name
@@ -38,7 +38,7 @@ PAGE = 1000                         # Supabase returns at most 1000 rows per req
 @lru_cache(maxsize=None)
 def get_client(url: str, key: str):
     """One connection per URL/key, shared by both classes."""
-    from supabase import create_client       # pip install supabase
+    from supabase import create_client  # pip install supabase
     return create_client(url, key)
 
 
@@ -108,13 +108,21 @@ class SupabaseFiles:
 
     name = "Supabase (storage + tables)"
 
-    # ---------------------------------------------------------------- file names
-    def names(self) -> dict[str, str]:
-        rows = self.db.table("documents").select("doc_id,name").execute().data
+    # ---------------------------------------------------------------- documents + names
+    # Every document row has an `owner` (the browser ID from app/ui/identity.py).
+    # Listing, naming and deleting only ever touch the rows of that owner.
+    def doc_ids(self, owner: str) -> list[str]:
+        rows = (self.db.table("documents").select("doc_id").eq("owner", owner)
+                .order("created_at").execute().data)
+        return [r["doc_id"] for r in rows]
+
+    def names(self, owner: str) -> dict[str, str]:
+        rows = self.db.table("documents").select("doc_id,name").eq("owner", owner).execute().data
         return {r["doc_id"]: r["name"] for r in rows}
 
-    def set_name(self, doc_id: str, filename: str) -> None:
-        self.db.table("documents").upsert({"doc_id": doc_id, "name": filename}).execute()
+    def set_name(self, doc_id: str, filename: str, owner: str) -> None:
+        self.db.table("documents").upsert({"doc_id": doc_id, "name": filename,
+                                           "owner": owner}).execute()
 
     # ---------------------------------------------------------------- PDFs
     def save_pdf(self, doc_id: str, data: bytes) -> Path:
@@ -150,12 +158,15 @@ class SupabaseFiles:
         }).execute()
 
     # ---------------------------------------------------------------- delete
-    def delete(self, doc_id: str) -> None:
+    def delete(self, doc_id: str, owner: str) -> bool:
         """Delete the document row -> its chunks and chat go too ('on delete cascade'),
-        then the PDF in storage and the local cached copy."""
-        self.db.table("documents").delete().eq("doc_id", doc_id).execute()
+        then the PDF in storage and the local cached copy. Only the owner's row matches."""
+        gone = self.db.table("documents").delete().eq("doc_id", doc_id).eq("owner", owner).execute()
+        if not gone.data:                                 # not this owner's document: touch nothing
+            return False
         try:
             self.db.storage.from_(BUCKET).remove([f"{doc_id}.pdf"])
         except Exception:
             pass
         (self.cache / f"{doc_id}.pdf").unlink(missing_ok=True)
+        return True

@@ -1,0 +1,1 @@
+"""Helpers for the Streamlit interface (streamlit_app.py). No RAG logic lives here."""
