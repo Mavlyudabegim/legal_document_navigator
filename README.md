@@ -153,17 +153,6 @@ Contradiction recall for both models (20b: 67% vs 76%; 120b: 67% vs 87%). Severa
 "errors" follow the annotators' conventions rather than being clear misreadings. A
 fine-tuned model learns those conventions from thousands of labels; prompting alone does not.
 
-### What was tried and rejected (gpt-oss-20b)
-
-| Change                                                                   | Result                                                                          |
-| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| Grade "Partly." answers as NotMentioned (looked helpful on 60 questions) | 75.3% → 73.3% on the 300 fixed questions, McNemar p = 0.03: rejected            |
-| Few-shot examples + exact hypothesis in the prompt (upper bound)         | First 165 questions: 75.2% → 76.4%, 10 fixed / 8 broken (p ≈ 0.8): no real gain |
-| More output tokens; follow-up search for "not mentioned" answers         | No significant gain                                                             |
-| bge-large embeddings + 500-token chunks                                  | Search improved (Hit@3 82% → 92%, 20 NDAs), answer accuracy unchanged           |
-| Whole contract in the prompt instead of search                           | 78.3% → 71.7% (60 questions)                                                    |
-| High reasoning effort                                                    | No gain, about 10× slower                                                       |
-
 ### Reproduce
 
 ```bash
