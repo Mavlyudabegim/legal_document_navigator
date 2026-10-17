@@ -30,8 +30,19 @@ from app.generation.llm import LLM
 from app.generation.prompts import NOT_FOUND, build_messages
 from app.retrieval.retriever import Retriever, Source
 
-# matches [S1], [S2, S3], [S1][S4]
-_CITE = re.compile(r"\[\s*(S\d+(?:\s*,\s*S\d+)*)\s*\]")
+# matches [S1], [S2, S3], [S1][S4] and also the styles bigger gpt-oss models like to use:
+# 【S1】, 【S1†L3-L5】, [S1†source], [S1; S2]
+_CITE = re.compile(r"[\[【]\s*(S\d+(?:\s*[,;]\s*S\d+)*)(?:\s*[†:][^\]】]*)?\s*[\]】]")
+
+
+def cited_labels(text: str) -> list[str]:
+    """All source labels cited in a raw answer, in order of first appearance: ['S2', 'S1']."""
+    order: list[str] = []
+    for m in _CITE.finditer(text or ""):
+        for label in re.split(r"\s*[,;]\s*", m.group(1)):
+            if label not in order:
+                order.append(label)
+    return order
 
 
 @dataclass
@@ -57,7 +68,7 @@ def _process_citations(raw: str, sources: list[Source]) -> tuple[str, list[Sourc
 
     def replace(m: re.Match) -> str:
         out = []
-        for label in re.split(r"\s*,\s*", m.group(1)):
+        for label in re.split(r"\s*[,;]\s*", m.group(1)):
             if label not in by_label:
                 invalid.add(label)            # the model cited something it was never given
                 continue
@@ -95,9 +106,8 @@ def _relabel(sources: list[Source]) -> list[Source]:
 
 
 def answer_question(question: str, retriever: Retriever, llm: LLM, doc_id: str | None = None,
-                    whole_doc_tokens: int = 0, followup: str = "none", followup_k: int = 15,
-                    guidance: str | None = None) -> Answer:
-    first = _answer_once(question, retriever, llm, doc_id, whole_doc_tokens, guidance=guidance)
+                    whole_doc_tokens: int = 0, followup: str = "none", followup_k: int = 15) -> Answer:
+    first = _answer_once(question, retriever, llm, doc_id, whole_doc_tokens)
     if followup == "none" or not doc_id or not says_not_mentioned(first):
         if says_not_mentioned(first):
             first.not_found_scope = "document" if first.timings.get("whole_doc") else "top_k"
@@ -115,7 +125,7 @@ def answer_question(question: str, retriever: Retriever, llm: LLM, doc_id: str |
     if not extra:
         first.not_found_scope = scope
         return first
-    second = _answer_once(question, retriever, llm, doc_id, 0, sources=_relabel(extra), guidance=guidance)
+    second = _answer_once(question, retriever, llm, doc_id, 0, sources=_relabel(extra))
     second.timings["retrieval"] = first.timings.get("retrieval", 0) + second.timings.get("retrieval", 0)
     second.timings["llm"] = first.timings.get("llm", 0) + second.timings.get("llm", 0)
     second.timings["followup"] = time.perf_counter() - t0
@@ -129,8 +139,7 @@ def answer_question(question: str, retriever: Retriever, llm: LLM, doc_id: str |
 
 
 def _answer_once(question: str, retriever: Retriever, llm: LLM, doc_id: str | None,
-                 whole_doc_tokens: int, sources: list[Source] | None = None,
-                 guidance: str | None = None) -> Answer:
+                 whole_doc_tokens: int, sources: list[Source] | None = None) -> Answer:
     question = question.strip()
     t0 = time.perf_counter()
     if sources is not None:                                    # follow-up: sources given
@@ -149,7 +158,7 @@ def _answer_once(question: str, retriever: Retriever, llm: LLM, doc_id: str | No
         return Answer(question, NOT_FOUND, found=False, candidates=candidates, timings=timings,
                       warnings=["No clause scored above the minimum similarity."])
 
-    system, user = build_messages(question, sources, guidance)
+    system, user = build_messages(question, sources)
     t1 = time.perf_counter()
     raw = llm.complete(system, user)
     if not raw.strip():                        # reasoning models can run out of tokens

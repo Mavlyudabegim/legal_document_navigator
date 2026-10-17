@@ -53,7 +53,6 @@ except ImportError:
 
 from app.generation.llm import LLM
 from app.generation.qa import answer_question
-from eval.fewshot import guidance_for, load_examples
 from app.ingestion.chunker import chunk_elements
 from app.ingestion.embedder import Embedder
 from app.ingestion.store import VectorStore
@@ -281,8 +280,7 @@ def _usage_diff(before: dict, after: dict) -> dict:
 
 def eval_end_to_end(retriever, llm, judge, questions, setup: str, cache_path: Path,
                     grading: str = "auto", whole_doc_tokens: int = 0, votes: int = 1,
-                    partly: str = "judge", followup: str = "none", followup_k: int = 15,
-                    examples: dict | None = None, with_hypothesis: bool = False):
+                    partly: str = "judge", followup: str = "none", followup_k: int = 15):
     """Answers are saved to cache_path one by one, so a rate-limit stop loses nothing:
     run the same command again and it continues where it stopped."""
     done = {}
@@ -303,9 +301,6 @@ def eval_end_to_end(retriever, llm, judge, questions, setup: str, cache_path: Pa
                 tries = []
                 for _ in range(max(1, votes)):
                     kw = {"followup": followup, "followup_k": followup_k} if followup != "none" else {}
-                    g = guidance_for(q, examples, with_hypothesis)
-                    if g:
-                        kw["guidance"] = g          # only passed when used, so older qa.py keeps working
                     a = answer_question(q["question"], retriever, llm, q["doc_id"],
                                         whole_doc_tokens=whole_doc_tokens, **kw)
                     if not a.found:
@@ -539,6 +534,12 @@ def run(a) -> None:
             if a.max_questions and len(qs) > a.max_questions:
                 qs = random.Random(0).sample(qs, a.max_questions)
         qs = sorted(qs, key=lambda q: q["doc_id"])          # one document at a time
+        if a.limit and a.limit < len(qs):
+            # an evenly spread subset of the fixed sample (every n-th question): same questions
+            # every time, all contracts covered; `compare` then pairs runs on the common questions
+            step = len(qs) / a.limit
+            qs = [qs[int(i * step)] for i in range(a.limit)]
+            print(f"  --limit {a.limit}: using every {step:.1f}-th question of the sample")
         # only pass reasoning_effort when asked, so older llm.py versions keep working
         # only pass extra settings when asked, so older llm.py versions keep working
         kw = {}
@@ -558,20 +559,13 @@ def run(a) -> None:
                  f"|mt{a.llm_max_tokens or 'default'}"
                  + (f"|partly:{a.partly}" if a.partly != "judge" else "")
                  + (f"|fu:{a.followup}{a.followup_k if a.followup == 'more' else ''}" if a.followup != "none" else "")
-                 + (f"|fs{a.fewshot}{a.fewshot_split}" if a.fewshot else "")
-                 + ("|hyp" if a.with_hypothesis else "")
                  + f"|{a.tag}")
         cache = ROOT / "results" / "contractnli_answers.jsonl"
         cache.parent.mkdir(exist_ok=True)
         print(f"\nEND-TO-END with '{last}', k={a.k}, answers by {llm.model}, judged by {judge.model}"
               f"  ({len(qs)} questions)")
-        examples = (load_examples(getattr(a, "data", DEFAULT_DATA), a.fewshot_split, qfile.get("split", "dev"), a.fewshot)
-                    if a.fewshot else None)
-        if examples:
-            print(f"  few-shot: {a.fewshot} labelled examples per hypothesis from the {a.fewshot_split} split")
         s, rows, stopped = eval_end_to_end(retrievers[last], llm, judge, qs, setup, cache, a.grading,
-                                           a.whole_doc_tokens, a.votes, a.partly, a.followup, a.followup_k,
-                                           examples=examples, with_hypothesis=a.with_hypothesis)
+                                           a.whole_doc_tokens, a.votes, a.partly, a.followup, a.followup_k)
         if stopped:
             print(f"\n  ⏸  Stopped: {stopped}.\n     Progress is saved. Run the same command later "
                   f"(or tomorrow) to continue. Results below are for the {len(rows)} questions done so far.")
@@ -706,6 +700,16 @@ def _load_rows(path: Path) -> tuple[dict, list[dict], dict]:
             q = qs.get((r["doc_id"], r["hypothesis_key"]))
             if q and "evidence" not in r:
                 r["evidence"] = q["evidence"]
+    # Runs made before qa.py understood 【S1】-style citations saved those answers with no
+    # citations. The answer text and the retrieved clauses were saved, so rebuild them here.
+    from app.generation.qa import cited_labels
+    for r in rows:
+        if not r.get("citations") and r.get("retrieved") and r.get("answer"):
+            idx = [int(lab[1:]) - 1 for lab in cited_labels(r["answer"])]
+            rebuilt = [r["retrieved"][i] for i in idx if 0 <= i < len(r["retrieved"])]
+            if rebuilt:
+                r["citations"], r["citations_rebuilt"] = rebuilt, True
+                r["cited_right"] = any(evidence_covered(c, e) for c in rebuilt for e in r.get("evidence", []))
     setup = str(data["end_to_end"].get("config", "")).split("|")[0]
     ranks = {(r["doc_id"], r["key"]): r["rank"] for r in data.get("rows", {}).get(setup, [])}
     return data, rows, ranks
@@ -837,6 +841,8 @@ def main():
     p.add_argument("--stratify", default="boost-false", choices=["boost-false", "proportional"],
                    help="boost-false = all Contradiction questions + the rest proportional (default)")
     p.add_argument("--sample-seed", type=int, default=42)
+    p.add_argument("--limit", type=int, default=0,
+                   help="answer only N evenly spread questions of the sample (for rate-limited APIs)")
     p.add_argument("--partly", default="judge", choices=["judge", "true", "not-mentioned"],
                    help="how to grade answers that start with 'Partly.' (default: LLM judge)")
     p.add_argument("--followup", default="none", choices=["none", "more", "whole"],
@@ -861,12 +867,6 @@ def main():
                         "Use 6000+ with --reasoning-effort high, or answers come back empty")
     p.add_argument("--reasoning-effort", choices=["low", "medium", "high"],
                    help="how much gpt-oss 'thinks' before answering (default: llm.py's setting)")
-    p.add_argument("--fewshot", type=int, default=0,
-                   help="show N labelled examples of the same hypothesis from another split (e.g. 3); 0 = off")
-    p.add_argument("--fewshot-split", default="test", choices=["train", "dev", "test"],
-                   help="split the examples come from; must differ from the evaluated split")
-    p.add_argument("--with-hypothesis", action="store_true",
-                   help="also show the original ContractNLI hypothesis behind each question")
     p.add_argument("--tag", default="v1", help="name for this experiment, e.g. 'prompt-v2'. "
                    "Change it after editing the prompt, otherwise saved answers are reused")
     p.add_argument("--max-wait", type=float, default=120,

@@ -13,6 +13,7 @@ default ("medium"), which gave the best accuracy in our ContractNLI evaluation (
 from __future__ import annotations
 
 import os
+import re
 
 def _setting(name: str) -> str | None:
     """Environment variable (.env locally) first, then Streamlit secrets (Streamlit Cloud)."""
@@ -32,6 +33,9 @@ PROVIDERS = {
     "groq":   ("openai/gpt-oss-20b",  "https://api.groq.com/openai/v1",   "GROQ_API_KEY"),
     "openai": ("gpt-4o-mini",         None,                               "OPENAI_API_KEY"),
     "ollama": ("gpt-oss:20b",         "http://localhost:11434/v1",        None),
+    # other OpenAI-compatible hosts with free tiers (check their current limits)
+    "cerebras":   ("gpt-oss-120b",          "https://api.cerebras.ai/v1",   "CEREBRAS_API_KEY"),
+    "openrouter": ("openai/gpt-oss-120b",   "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
 }
 
 
@@ -82,7 +86,12 @@ class LLM:
             self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
         self.last_finish_reason = resp.choices[0].finish_reason
         self.length_hits += self.last_finish_reason == "length"
-        return (resp.choices[0].message.content or "").strip()
+        text = resp.choices[0].message.content or ""
+        # some local models (e.g. Qwen3, DeepSeek-R1) put their thinking in the answer as
+        # <think>...</think>; remove it so the answer starts with "Yes."/"No." as the prompt asks
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL)   # opening tag already cut off
+        return text.strip()
 
     def usage(self) -> dict:
         return {"calls": self.calls, "prompt_tokens": self.prompt_tokens,
