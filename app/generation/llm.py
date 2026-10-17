@@ -47,6 +47,9 @@ class LLM:
         self.temperature, self.max_tokens = temperature, max_tokens
         self.reasoning_effort = reasoning_effort
         self._client = None
+        # usage counters, for latency/cost reports (eval/contractnli.py)
+        self.calls = self.prompt_tokens = self.completion_tokens = self.length_hits = 0
+        self.last_finish_reason = None           # "length" = ran out of max_tokens
 
     def _get_client(self):
         if self._client is None:
@@ -72,4 +75,15 @@ class LLM:
                       {"role": "user", "content": user}],
             **extra,
         )
+        self.calls += 1
+        usage = getattr(resp, "usage", None)
+        if usage is not None:                    # thinking tokens are counted as completion tokens
+            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+        self.last_finish_reason = resp.choices[0].finish_reason
+        self.length_hits += self.last_finish_reason == "length"
         return (resp.choices[0].message.content or "").strip()
+
+    def usage(self) -> dict:
+        return {"calls": self.calls, "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens, "length_hits": self.length_hits}

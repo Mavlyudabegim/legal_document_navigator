@@ -126,21 +126,24 @@ class Retriever:
                 fused[i] += 1.0 / (self.rrf_k + rank)
         return sorted(fused, key=fused.get, reverse=True)
 
-    def search(self, question: str, doc_id: str | None = None) -> list[Source]:
-        """Top-k candidates with scores, including weak ones (for debugging)."""
+    def search(self, question: str, doc_id: str | None = None, k: int | None = None) -> list[Source]:
+        """Top-k candidates with scores, including weak ones (for debugging).
+        k overrides self.k for one call (used by the follow-up search in qa.py)."""
+        k = k or self.k
         idx = self._index(doc_id)
         if not idx.ids:
             return []
         q = self.embedder.embed_query(question)
         cos = idx.emb @ q
-        dense_rank = list(np.argsort(-cos)[: self.candidates])
+        n_cand = max(self.candidates, k)
+        dense_rank = list(np.argsort(-cos)[: n_cand])
 
         if self.mode == "dense":
             order = dense_rank
         else:
             bm = idx.bm25.get_scores(tokenize(question))
-            sparse_rank = [i for i in np.argsort(-bm)[: self.candidates] if bm[i] > 0]
-            order = self._rrf(dense_rank, sparse_rank)[: self.candidates]
+            sparse_rank = [i for i in np.argsort(-bm)[: n_cand] if bm[i] > 0]
+            order = self._rrf(dense_rank, sparse_rank)[: n_cand]
 
         rerank = None
         if self.reranker is not None:
@@ -148,7 +151,7 @@ class Retriever:
             order = sorted(order, key=lambda i: rerank[i], reverse=True)
 
         out = []
-        for n, i in enumerate(order[: self.k], start=1):
+        for n, i in enumerate(order[: k], start=1):
             m = idx.metas[i]
             out.append(Source(
                 label=f"S{n}", chunk_id=idx.ids[i], text=idx.texts[i],

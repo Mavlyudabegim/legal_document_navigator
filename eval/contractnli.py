@@ -22,10 +22,14 @@ USE
     # 2. retrieval only (fast, free): compare setups
     python -m eval.contractnli run --configs dense,hybrid,hybrid+rerank
 
-    # 3. full pipeline: also calls the LLM (2 calls per question; start small!)
-    python -m eval.contractnli run --configs hybrid --llm --max-questions 60 -k 3 \\
-        --judge-model llama-3.1-8b-instant
-    #    Free tier stopped you? Progress is saved: run the SAME command later to continue.
+    # 3. full pipeline on a FIXED, stratified sample (same questions for every setup)
+    python -m eval.contractnli prepare --split dev --n-docs 61          # all 61 dev NDAs
+    python -m eval.contractnli run --configs hybrid --llm --sample 300 --tag my-setup
+    #    Stopped by a rate limit? Progress is saved: run the SAME command later to continue.
+
+    # 4. reports
+    python -m eval.contractnli analyze                 # per-label F1, citations, contradiction errors
+    python -m eval.contractnli compare --a OLD.json --b NEW.json   # paired test on the same questions
 
 Tune on the "dev" split. When you're done, run once on "test" for the numbers in your README.
 """
@@ -49,11 +53,14 @@ except ImportError:
 
 from app.generation.llm import LLM
 from app.generation.qa import answer_question
+from eval.fewshot import guidance_for, load_examples
 from app.ingestion.chunker import chunk_elements
 from app.ingestion.embedder import Embedder
 from app.ingestion.store import VectorStore
 from app.ingestion.text_parser import parse_text
 from app.retrieval.retriever import Retriever
+from eval.analysis import build_report
+from eval.metrics import LABELS, NAMES, citation_summary, class_report, evidence_covered, mcnemar
 
 ROOT = Path(__file__).parent
 DEFAULT_DATA = Path("data/contract-nli")
@@ -88,25 +95,7 @@ QUESTIONS = {
 GOLD = {"Entailment": "TRUE", "Contradiction": "FALSE", "NotMentioned": "NOT_MENTIONED"}
 
 
-# ------------------------------------------------------------------ evidence matching
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", s.lower())).strip()
-
-
-def evidence_covered(chunk_text: str, evidence: str, n: int = 6, need: float = 0.5) -> bool:
-    """Is this evidence sentence inside the chunk?  Our parser joins lines and fixes
-    hyphens, so we compare normalised text, using word 6-grams so that evidence split
-    across two chunks still counts if at least half of it is in this one."""
-    c, e = _norm(chunk_text), _norm(evidence)
-    if not e:
-        return False
-    if e in c:
-        return True
-    words = e.split()
-    if len(words) <= n:
-        return False
-    grams = [" ".join(words[i:i + n]) for i in range(len(words) - n + 1)]
-    return sum(g in c for g in grams) / len(grams) >= need
+# evidence matching (evidence_covered) lives in eval/metrics.py
 
 
 # ------------------------------------------------------------------ prepare
@@ -214,12 +203,20 @@ def label_from_opening(answer: str) -> str | None:
     return None                       # "Partly." or free text -> ask the judge
 
 
-def grade(answer: str, hypothesis: str, judge, mode: str) -> tuple[str, str]:
-    """Returns (label, how). mode 'auto' = opening phrase first, judge as fallback."""
+PARTLY_RULES = {"true": "TRUE", "not-mentioned": "NOT_MENTIONED"}
+
+
+def grade(answer: str, hypothesis: str, judge, mode: str, partly: str = "judge") -> tuple[str, str]:
+    """Returns (label, how). mode 'auto' = opening phrase first, judge as fallback.
+    partly: what a "Partly." answer counts as. 'judge' (default) lets the LLM judge decide;
+    'true' / 'not-mentioned' use a fixed rule (see the contradiction analysis: the judge
+    often turns "Partly." into FALSE, which creates false contradictions)."""
     if mode == "auto":
         lab = label_from_opening(answer)
         if lab:
             return lab, "opening"
+        if partly in PARTLY_RULES and re.match(r"^[\s*_#>\-]*partly\b", answer or "", re.IGNORECASE):
+            return PARTLY_RULES[partly], "partly-rule"
     v = judge.complete(JUDGE_SYSTEM, JUDGE_USER.format(hyp=hypothesis, ans=answer))
     v = v.strip().upper().replace(" ", "_")
     return next((x for x in ("NOT_MENTIONED", "FALSE", "TRUE") if x in v), "NOT_MENTIONED"), "judge"
@@ -248,6 +245,13 @@ class RetryLLM:
         self.llm, self.pause, self.max_wait = llm, pause, max_wait
         self.provider, self.model = llm.provider, llm.model
 
+    def usage(self) -> dict:
+        return self.llm.usage() if hasattr(self.llm, "usage") else {}
+
+    @property
+    def last_finish_reason(self):
+        return getattr(self.llm, "last_finish_reason", None)
+
     def complete(self, system: str, user: str) -> str:
         for attempt in range(8):
             try:
@@ -270,8 +274,15 @@ def _cache_key(q: dict, setup: str) -> str:
     return f"{setup}|{q['doc_id']}|{q['hypothesis_key']}"
 
 
+def _usage_diff(before: dict, after: dict) -> dict:
+    return {k: after.get(k, 0) - before.get(k, 0)
+            for k in ("calls", "prompt_tokens", "completion_tokens", "length_hits")}
+
+
 def eval_end_to_end(retriever, llm, judge, questions, setup: str, cache_path: Path,
-                    grading: str = "auto", whole_doc_tokens: int = 0, votes: int = 1):
+                    grading: str = "auto", whole_doc_tokens: int = 0, votes: int = 1,
+                    partly: str = "judge", followup: str = "none", followup_k: int = 15,
+                    examples: dict | None = None, with_hypothesis: bool = False):
     """Answers are saved to cache_path one by one, so a rate-limit stop loses nothing:
     run the same command again and it continues where it stopped."""
     done = {}
@@ -287,15 +298,20 @@ def eval_end_to_end(retriever, llm, judge, questions, setup: str, cache_path: Pa
     with cache_path.open("a") as f:
         for i, q in enumerate(todo, 1):
             t0 = time.perf_counter()
+            u_llm, u_judge = llm.usage(), judge.usage()
             try:
                 tries = []
                 for _ in range(max(1, votes)):
+                    kw = {"followup": followup, "followup_k": followup_k} if followup != "none" else {}
+                    g = guidance_for(q, examples, with_hypothesis)
+                    if g:
+                        kw["guidance"] = g          # only passed when used, so older qa.py keeps working
                     a = answer_question(q["question"], retriever, llm, q["doc_id"],
-                                        whole_doc_tokens=whole_doc_tokens)
+                                        whole_doc_tokens=whole_doc_tokens, **kw)
                     if not a.found:
                         lab, how_ = "NOT_MENTIONED", "not-found"
                     else:
-                        lab, how_ = grade(a.text, q["hypothesis"], judge, grading)
+                        lab, how_ = grade(a.text, q["hypothesis"], judge, grading, partly)
                     tries.append((lab, how_, a))
                 # majority vote (with 1 vote this is just the single answer)
                 pred = Counter(t[0] for t in tries).most_common(1)[0][0]
@@ -307,7 +323,20 @@ def eval_end_to_end(retriever, llm, judge, questions, setup: str, cache_path: Pa
                    **{k: q[k] for k in ("doc_id", "hypothesis_key", "short", "question", "gold")},
                    "pred": pred, "graded_by": how, "answer": a.text,
                    "seconds": time.perf_counter() - t0,
-                   "cited_right": any(evidence_covered(c.text, e) for c in a.citations for e in q["evidence"])}
+                   "cited_right": any(evidence_covered(c.text, e) for c in a.citations for e in q["evidence"]),
+                   # saved so citation quality can be measured later (eval/metrics.py)
+                   "citations": [c.text for c in a.citations],
+                   "retrieved": [s.text for s in a.retrieved],
+                   "evidence": q["evidence"],
+                   # latency / cost / failure diagnostics
+                   "usage": _usage_diff(u_llm, llm.usage()),
+                   "judge_usage": _usage_diff(u_judge, judge.usage()),
+                   "finish_reason": llm.last_finish_reason,
+                   "empty": "returned an empty answer" in (a.text or ""),
+                   # follow-up search for "not mentioned" answers (qa.py)
+                   "followup": getattr(a, "followup", None),
+                   "first_label": label_from_opening(a.first_text) if getattr(a, "first_text", None) else None,
+                   "not_found_scope": getattr(a, "not_found_scope", None)}
             f.write(json.dumps(row) + "\n")
             f.flush()
             done[row["key"]] = row
@@ -353,8 +382,14 @@ def paper_metrics(rows: list[dict]) -> dict:
             "f1_contradiction": f1("FALSE"), "f1_entailment": f1("TRUE"), "n": n}
 
 
-def print_paper_comparison(rows: list[dict]) -> None:
+def print_paper_comparison(rows: list[dict], weights: dict | None = None) -> None:
     m = paper_metrics(rows)
+    if weights:              # stratified sample: compare at the real label mix, like the paper
+        from eval.metrics import weighted_accuracy, weighted_prf
+        w = weighted_prf(rows, weights)
+        m.update(accuracy=weighted_accuracy(rows, weights), f1_contradiction=w["FALSE"]["f1"],
+                 f1_entailment=w["TRUE"]["f1"])
+        print("\n  (stratified sample: numbers below are re-weighted to the real label mix)")
     print(f"\n  Compared with the ContractNLI paper (Span NLI BERT-large, fine-tuned, full test set):")
     print(f"  {'':<22}{'yours':>10}{'paper':>10}")
     print(f"  {'Accuracy':<22}{m['accuracy']:>10.3f}{0.875:>10.3f}   "
@@ -365,6 +400,88 @@ def print_paper_comparison(rows: list[dict]) -> None:
 
 def pct(x) -> str:
     return "  n/a " if x is None else f"{100 * x:5.1f}%"
+
+
+# ------------------------------------------------------------------ fixed, stratified sample
+SAMPLES_DIR = ROOT / "samples"
+
+
+def label_shares(questions: list[dict]) -> dict[str, float]:
+    c = Counter(q["gold"] for q in questions)
+    return {lab: c[lab] / len(questions) for lab in LABELS}
+
+
+def stratified_sample(questions: list[dict], n: int, seed: int, strategy: str) -> list[dict]:
+    """proportional : the same label mix as the full question set
+    boost-false     : ALL Contradiction questions (they are only ~10% of ContractNLI, so a
+                      proportional sample has too few to measure their F1), the rest split
+                      proportionally between Entailment and NotMentioned. The headline accuracy
+                      is then re-weighted to the real mix (metrics.weighted_accuracy)."""
+    rnd = random.Random(seed)
+    groups = {lab: sorted((q for q in questions if q["gold"] == lab),
+                          key=lambda q: (q["doc_id"], q["hypothesis_key"])) for lab in LABELS}
+    for g in groups.values():
+        rnd.shuffle(g)
+    n = min(n, len(questions))
+    if strategy == "boost-false":
+        take = {"FALSE": min(len(groups["FALSE"]), n // 2)}
+        rest = n - take["FALSE"]
+        t, nm = len(groups["TRUE"]), len(groups["NOT_MENTIONED"])
+        take["TRUE"] = min(t, round(rest * t / (t + nm)))
+        take["NOT_MENTIONED"] = min(nm, rest - take["TRUE"])
+    else:
+        shares = label_shares(questions)
+        take = {lab: round(n * shares[lab]) for lab in LABELS}
+    return [q for lab in LABELS for q in groups[lab][: take[lab]]]
+
+
+def fixed_sample(questions: list[dict], qfile: dict, n: int, seed: int, strategy: str) -> list[dict]:
+    """The sample is saved to eval/samples/ the first time, then always re-used, so every
+    setup you test answers exactly the same questions (a fair, paired comparison)."""
+    n_docs = len({q["doc_id"] for q in questions})
+    path = SAMPLES_DIR / f"{qfile.get('split', 'dev')}-{n_docs}docs-{n}-{strategy}-seed{seed}.json"
+    by_key = {(q["doc_id"], q["hypothesis_key"]): q for q in questions}
+    if path.exists():
+        keys = [tuple(k) for k in json.loads(path.read_text())["keys"]]
+        missing = [k for k in keys if k not in by_key]
+        if missing:
+            raise SystemExit(f"{path.name} lists {len(missing)} questions that are not in the current "
+                             f"question file. Run `prepare` with the same --split/--n-docs/--seed again.")
+        print(f"Using the fixed sample {path.relative_to(ROOT.parent)} ({len(keys)} questions)")
+        return [by_key[k] for k in keys]
+    sample = stratified_sample(questions, n, seed, strategy)
+    SAMPLES_DIR.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"split": qfile.get("split"), "n_docs": n_docs, "strategy": strategy,
+                                "seed": seed, "label_shares_full_set": label_shares(questions),
+                                "keys": [[q["doc_id"], q["hypothesis_key"]] for q in sample]}, indent=1))
+    print(f"Created the fixed sample {path.relative_to(ROOT.parent)} ({len(sample)} questions) — "
+          f"commit it, so later runs use the same questions")
+    return sample
+
+
+def print_class_table(rows: list[dict], weights: dict | None = None) -> None:
+    rep = class_report(rows)
+    lo, hi = rep["accuracy_ci"]
+    print(f"\n  Per label (n={rep['n']}):  accuracy {pct(rep['accuracy'])} (95% {100*lo:.0f}–{100*hi:.0f}%)"
+          f"  ·  macro-F1 {rep['macro_f1']:.3f}")
+    if weights:
+        from eval.metrics import weighted_accuracy
+        print(f"  Accuracy re-weighted to the real label mix: {pct(weighted_accuracy(rows, weights))}")
+    print(f"  {'label':<15}{'precision':>10}{'recall':>9}{'F1':>8}{'support':>9}")
+    for lab in LABELS:
+        m = rep["per_class"][lab]
+        print(f"  {NAMES[lab]:<15}{m['precision']:>10.3f}{m['recall']:>9.3f}{m['f1']:>8.3f}{m['support']:>9}")
+    if weights:
+        from eval.metrics import weighted_prf
+        w = weighted_prf(rows, weights)
+        print("  Re-weighted to the real label mix (what you'd see on real contracts):")
+        for lab in LABELS:
+            print(f"  {NAMES[lab]:<15}{w[lab]['precision']:>10.3f}{w[lab]['recall']:>9.3f}{w[lab]['f1']:>8.3f}")
+    cs = citation_summary(rows)
+    if cs and cs.get("answers_with_citations"):
+        print(f"  Citations: supported {pct(cs['supported'])} · precision {pct(cs['precision'])} · "
+              f"recall {pct(cs['recall'])} · right label but unsupported {pct(cs['right_label_unsupported'])} · "
+              f"strict accuracy {pct(cs['strict_accuracy'])}")
 
 
 def run(a) -> None:
@@ -412,9 +529,15 @@ def run(a) -> None:
         print(f"  {pct(h3)}  ({len(rs):>3})  {short}")
 
     if a.llm:
-        qs = questions
-        if a.max_questions and len(qs) > a.max_questions:
-            qs = random.Random(0).sample(qs, a.max_questions)
+        weights = None
+        if a.sample:
+            qs = fixed_sample(questions, qfile, a.sample, a.sample_seed, a.stratify)
+            if a.stratify == "boost-false":
+                weights = label_shares(questions)
+        else:                                               # old behaviour (--max-questions)
+            qs = questions
+            if a.max_questions and len(qs) > a.max_questions:
+                qs = random.Random(0).sample(qs, a.max_questions)
         qs = sorted(qs, key=lambda q: q["doc_id"])          # one document at a time
         # only pass reasoning_effort when asked, so older llm.py versions keep working
         # only pass extra settings when asked, so older llm.py versions keep working
@@ -432,18 +555,30 @@ def run(a) -> None:
         setup = (f"{last}|k{a.k}|{qfile.get('max_tokens', 350)}|{llm.model}|judge:{judge.model}"
                  f"|re:{a.reasoning_effort or 'default'}|grade:{a.grading}"
                  f"|q{qfile.get('questions_version', 1)}|wd{a.whole_doc_tokens}|v{a.votes}"
-                 f"|mt{a.llm_max_tokens or 'default'}|{a.tag}")
+                 f"|mt{a.llm_max_tokens or 'default'}"
+                 + (f"|partly:{a.partly}" if a.partly != "judge" else "")
+                 + (f"|fu:{a.followup}{a.followup_k if a.followup == 'more' else ''}" if a.followup != "none" else "")
+                 + (f"|fs{a.fewshot}{a.fewshot_split}" if a.fewshot else "")
+                 + ("|hyp" if a.with_hypothesis else "")
+                 + f"|{a.tag}")
         cache = ROOT / "results" / "contractnli_answers.jsonl"
         cache.parent.mkdir(exist_ok=True)
         print(f"\nEND-TO-END with '{last}', k={a.k}, answers by {llm.model}, judged by {judge.model}"
               f"  ({len(qs)} questions)")
+        examples = (load_examples(getattr(a, "data", DEFAULT_DATA), a.fewshot_split, qfile.get("split", "dev"), a.fewshot)
+                    if a.fewshot else None)
+        if examples:
+            print(f"  few-shot: {a.fewshot} labelled examples per hypothesis from the {a.fewshot_split} split")
         s, rows, stopped = eval_end_to_end(retrievers[last], llm, judge, qs, setup, cache, a.grading,
-                                           a.whole_doc_tokens, a.votes)
+                                           a.whole_doc_tokens, a.votes, a.partly, a.followup, a.followup_k,
+                                           examples=examples, with_hypothesis=a.with_hypothesis)
         if stopped:
             print(f"\n  ⏸  Stopped: {stopped}.\n     Progress is saved. Run the same command later "
                   f"(or tomorrow) to continue. Results below are for the {len(rows)} questions done so far.")
         if s:
-            results["end_to_end"] = {"config": setup, **s, "rows": rows}
+            results["end_to_end"] = {"config": setup, **s, "rows": rows, "label_weights": weights,
+                                     "sample": {"n": a.sample, "strategy": a.stratify, "seed": a.sample_seed}
+                                     if a.sample else None}
             print(f"\n  Results for {s['n']}/{len(qs)} questions")
             print(f"  Label accuracy  {pct(s['label_accuracy'])}  (TRUE / FALSE / NOT_MENTIONED matches the lawyers)")
             print(f"  Answered        {pct(s['answered'])}  (TRUE/FALSE questions not called 'not found')")
@@ -457,7 +592,10 @@ def run(a) -> None:
             print("  Mistakes (gold->pred):",
                   ", ".join(f"{k}: {v}" for k, v in s["confusion"].most_common()
                             if k.split("->")[0] != k.split("->")[1]) or "none")
-            print_paper_comparison(rows)
+            print_class_table(rows, weights)
+            print_paper_comparison(rows, weights)
+            print("\n  Full report (per-label intervals, citations, contradiction errors):"
+                  "  python -m eval.contractnli analyze")
 
     out = ROOT / "results" / f"contractnli-{datetime.now():%Y%m%d-%H%M%S}.json"
     out.parent.mkdir(exist_ok=True)
@@ -523,7 +661,7 @@ def regrade(a) -> None:
     for r in rows:
         old = r["pred"]
         answer = (r.get("answer") or "").strip()
-        new, how = grade(answer, hyp[(r["doc_id"], r["hypothesis_key"])], judge, a.grading)
+        new, how = grade(answer, hyp[(r["doc_id"], r["hypothesis_key"])], judge, a.grading, a.partly)
         r["graded_by"] = how
         if new != old:
             changed += 1
@@ -540,11 +678,110 @@ def regrade(a) -> None:
     print(f"  Answered        {pct(sum(r['pred'] != 'NOT_MENTIONED' for r in ans) / len(ans) if ans else None)}")
     print(f"  Refused right   {pct(sum(r['pred'] == 'NOT_MENTIONED' for r in una) / len(una) if una else None)}")
     print("  Mistakes (gold->pred):", ", ".join(f"{k}: {v}" for k, v in conf.most_common()) or "none")
-    print_paper_comparison(rows)
+    print_class_table(rows, data["end_to_end"].get("label_weights"))
+    print_paper_comparison(rows, data["end_to_end"].get("label_weights"))
     data["end_to_end"].update(label_accuracy=acc, rows=rows, regraded_with=judge.model)
-    out = path.with_name(path.stem + "-regraded.json")
+    out = path.with_name(path.stem + ("-regraded.json" if a.partly == "judge" else f"-partly-{a.partly}.json"))
     out.write_text(json.dumps(data, indent=1, default=str))
     print(f"\nSaved {out}")
+
+
+# ------------------------------------------------------------------ analyze / compare
+def _latest_e2e() -> Path:
+    files = [f for f in sorted((ROOT / "results").glob("contractnli-*.json"))
+             if "end_to_end" in json.loads(f.read_text())]
+    if not files:
+        raise SystemExit("No end-to-end results yet. Run `run --llm` first.")
+    return files[-1]
+
+
+def _load_rows(path: Path) -> tuple[dict, list[dict], dict]:
+    """Rows of a saved run, with evidence/hypothesis added from the question file when the run
+    is older and didn't store them. Also returns retrieval ranks for 'search vs reading' errors."""
+    data = json.loads(path.read_text())
+    rows = data["end_to_end"]["rows"]
+    if QUESTIONS_FILE.exists():
+        qs = {(q["doc_id"], q["hypothesis_key"]): q for q in json.loads(QUESTIONS_FILE.read_text())["questions"]}
+        for r in rows:
+            q = qs.get((r["doc_id"], r["hypothesis_key"]))
+            if q and "evidence" not in r:
+                r["evidence"] = q["evidence"]
+    setup = str(data["end_to_end"].get("config", "")).split("|")[0]
+    ranks = {(r["doc_id"], r["key"]): r["rank"] for r in data.get("rows", {}).get(setup, [])}
+    return data, rows, ranks
+
+
+def analyze(a) -> None:
+    path = Path(a.file) if a.file else _latest_e2e()
+    data, rows, ranks = _load_rows(path)
+    e2e = data["end_to_end"]
+    md = build_report(rows, title=f"ContractNLI evaluation — {path.name}", setup=str(e2e.get("config", "")),
+                      ranks=ranks, weights=e2e.get("label_weights"), price_in=a.price_in, price_out=a.price_out)
+    out = Path(a.out) if a.out else path.with_name(path.stem + "-report.md")
+    out.write_text(md)
+    print(md)
+    print(f"\nSaved {out}")
+
+
+def compare(a) -> None:
+    """Controlled experiments: several runs on the SAME questions, side by side.
+    The first run is the baseline; each other run gets the difference in accuracy and macro-F1
+    with a 95% interval that resamples whole contracts (questions from one contract are related),
+    plus McNemar's test on the individual questions."""
+    from eval.metrics import (accuracy, cluster_bootstrap_ci, latency_cost, macro_f1,
+                              paired_cluster_diff, weighted_accuracy)
+    paths = list(a.runs or []) or [a.a, a.b]
+    if len(paths) < 2 or not all(paths):
+        raise SystemExit("Give at least two results files: --runs BASE.json NEW.json [MORE.json ...]")
+    runs = []
+    for p in paths:
+        data, rows, _ = _load_rows(Path(p))
+        tag = str(data["end_to_end"].get("config", "")).split("|")[-1] or Path(p).stem
+        if Path(p).stem.endswith(("-regraded", "-not-mentioned", "-true")):
+            tag += " (" + Path(p).stem.split("-", 2)[-1] + ")"
+        runs.append({"path": p, "tag": tag, "rows": rows, "weights": data["end_to_end"].get("label_weights")})
+    key = lambda r: (r["doc_id"], r["hypothesis_key"])  # noqa: E731
+    common = set.intersection(*[{key(r) for r in run["rows"]} for run in runs])
+    for run in runs:
+        run["rows"] = [r for r in run["rows"] if key(r) in common]
+    n_docs = len({k[0] for k in common})
+    lines = [f"# Controlled comparison — {len(common)} common questions from {n_docs} contracts", "",
+             "| Run | Accuracy (95% CI, by contract) | Acc. real mix | Macro-F1 | F1 Entail. | F1 Contr. | F1 NotMent. "
+             "| Strict acc. | Cited evidence | s/question | Tokens in/out | $ per 1k q | Empty |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for run in runs:
+        rows = run["rows"]
+        rep = class_report(rows)
+        lo, hi = cluster_bootstrap_ci(rows, accuracy)
+        cs = citation_summary(rows)
+        lc = latency_cost(rows, a.price_in, a.price_out)
+        wacc = weighted_accuracy(rows, run["weights"]) if run["weights"] else None
+        f = {lab: rep["per_class"][lab]["f1"] for lab in LABELS}
+        tok = f"{lc['tokens_in']:.0f}/{lc['tokens_out']:.0f}" if lc["tokens_in"] is not None else "n/a"
+        cost = f"{lc['usd_per_1000']:.2f}" if "usd_per_1000" in lc else "n/a"
+        lines.append(f"| {run['tag']} | {100*rep['accuracy']:.1f}% ({100*lo:.0f}–{100*hi:.0f}) | "
+                     f"{pct(wacc).strip()} | {rep['macro_f1']:.3f} | {f['TRUE']:.3f} | {f['FALSE']:.3f} | "
+                     f"{f['NOT_MENTIONED']:.3f} | {pct(cs.get('strict_accuracy')).strip() if cs else 'n/a'} | "
+                     f"{pct(cs.get('supported')).strip() if cs else 'n/a'} | "
+                     f"{lc['seconds_mean']:.1f} | {tok} | {cost} | {lc['empty']} |")
+    base = runs[0]
+    lines += ["", f"Differences against the baseline **{base['tag']}** (B − A):", "",
+              "| Run | Δ accuracy (95% CI) | p (by contract) | McNemar p | only A right / only B right | Δ macro-F1 (95% CI) |",
+              "|---|---|---|---|---|---|"]
+    for run in runs[1:]:
+        d = paired_cluster_diff(base["rows"], run["rows"], accuracy)
+        dm = paired_cluster_diff(base["rows"], run["rows"], macro_f1)
+        m = mcnemar(base["rows"], run["rows"])
+        lines.append(f"| {run['tag']} | {100*d['diff']:+.1f} pts ({100*d['ci'][0]:+.1f} to {100*d['ci'][1]:+.1f}) | "
+                     f"{d['p']:.3f} | {m['p_value']:.3f} | {m['a_only']} / {m['b_only']} | "
+                     f"{dm['diff']:+.3f} ({dm['ci'][0]:+.3f} to {dm['ci'][1]:+.3f}) |")
+    lines += ["", "A difference is convincing when its interval does not include 0. The contract-level interval "
+              "is the stricter one: it allows for questions from the same contract being related.", ""]
+    md = "\n".join(lines)
+    print(md)
+    if a.out:
+        Path(a.out).write_text(md)
+        print(f"Saved {a.out}")
 
 
 # ------------------------------------------------------------------ main
@@ -562,6 +799,20 @@ def main():
     g.add_argument("--grading", default="auto", choices=["auto", "judge"],
                    help="auto = read 'Yes./No./Partly./doesn't say' from the answer, judge only if needed")
     g.add_argument("--max-wait", type=float, default=120)
+    g.add_argument("--partly", default="judge", choices=["judge", "true", "not-mentioned"],
+                   help="how to grade answers that start with 'Partly.' (rule-based = no LLM calls)")
+    z = sub.add_parser("analyze", help="Markdown report: per-label F1, citations, contradiction errors")
+    z.add_argument("--file", help="a results file (default: the latest with LLM answers)")
+    z.add_argument("--out", help="where to write the report (default: next to the results file)")
+    z.add_argument("--price-in", type=float, default=0.0, help="USD per 1M input tokens (0 = local model)")
+    z.add_argument("--price-out", type=float, default=0.0, help="USD per 1M output tokens")
+    c = sub.add_parser("compare", help="controlled comparison of runs on the same questions")
+    c.add_argument("--runs", nargs="+", help="results files; the FIRST is the baseline")
+    c.add_argument("--a", help="baseline results file (same as the first of --runs)")
+    c.add_argument("--b", help="new results file")
+    c.add_argument("--price-in", type=float, default=0.0, help="USD per 1M input tokens (0 = local model)")
+    c.add_argument("--price-out", type=float, default=0.0, help="USD per 1M output tokens")
+    c.add_argument("--out", help="also save the table as Markdown")
     for name in ("prepare", "run"):
         p = sub.add_parser(name)
         p.add_argument("--emb-backend", default="local")
@@ -579,7 +830,19 @@ def main():
     p.add_argument("-k", type=int, default=5)
     p.add_argument("--min-score", type=float, default=0.0)
     p.add_argument("--llm", action="store_true")
-    p.add_argument("--max-questions", type=int, default=60)
+    p.add_argument("--max-questions", type=int, default=60,
+                   help="old random sample; prefer --sample, which is fixed and stratified")
+    p.add_argument("--sample", type=int, default=0,
+                   help="fixed stratified sample of N questions, saved in eval/samples/ and re-used (e.g. 300)")
+    p.add_argument("--stratify", default="boost-false", choices=["boost-false", "proportional"],
+                   help="boost-false = all Contradiction questions + the rest proportional (default)")
+    p.add_argument("--sample-seed", type=int, default=42)
+    p.add_argument("--partly", default="judge", choices=["judge", "true", "not-mentioned"],
+                   help="how to grade answers that start with 'Partly.' (default: LLM judge)")
+    p.add_argument("--followup", default="none", choices=["none", "more", "whole"],
+                   help="second look for 'not mentioned' answers: 'more' = next clauses of the ranking, "
+                        "'whole' = the rest of the contract")
+    p.add_argument("--followup-k", type=int, default=15, help="with --followup more: look at clauses up to this rank")
     p.add_argument("--pause", type=float, default=2.0, help="seconds between LLM calls")
     p.add_argument("--provider", default="groq")
     p.add_argument("--model")
@@ -598,12 +861,19 @@ def main():
                         "Use 6000+ with --reasoning-effort high, or answers come back empty")
     p.add_argument("--reasoning-effort", choices=["low", "medium", "high"],
                    help="how much gpt-oss 'thinks' before answering (default: llm.py's setting)")
+    p.add_argument("--fewshot", type=int, default=0,
+                   help="show N labelled examples of the same hypothesis from another split (e.g. 3); 0 = off")
+    p.add_argument("--fewshot-split", default="test", choices=["train", "dev", "test"],
+                   help="split the examples come from; must differ from the evaluated split")
+    p.add_argument("--with-hypothesis", action="store_true",
+                   help="also show the original ContractNLI hypothesis behind each question")
     p.add_argument("--tag", default="v1", help="name for this experiment, e.g. 'prompt-v2'. "
                    "Change it after editing the prompt, otherwise saved answers are reused")
     p.add_argument("--max-wait", type=float, default=120,
                    help="longest rate-limit wait (seconds) before stopping; progress is saved")
     a = ap.parse_args()
-    {"prepare": prepare, "run": run, "mistakes": mistakes, "regrade": regrade}[a.cmd](a)
+    {"prepare": prepare, "run": run, "mistakes": mistakes, "regrade": regrade,
+     "analyze": analyze, "compare": compare}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,14 @@ document does not cover.
 11. Before answering "Yes." or "No.", check every source for exceptions, conditions and
     exclusions (for example, "only for the Purpose" plus a clause allowing other use
     means "Partly."). Treat attorneys, accountants and consultants as professional advisors.
+12. If the question asks whether something is "only" X, and the document defines it to
+    include things other than X, answer "No." (the document contradicts "only").
+13. If something is forbidden unless a condition is met (consent, necessity, a stated
+    purpose), the general rule is a prohibition: answer "No." to "is it allowed?".
+14. If a definition gives alternatives joined by "or" (marked as confidential OR otherwise
+    known to be confidential), no single alternative is required.
+15. A duty to return or destroy information is not a ban on keeping specific items.
+    Answer "No." only when a clause explicitly forbids it; otherwise "The document doesn't say this."
 """
 
 
@@ -58,8 +66,11 @@ def format_sources(sources: list[Source]) -> str:
     return "\n\n".join(blocks)
 
 
-def build_messages(question: str, sources: list[Source]) -> tuple[str, str]:
-    """Returns (system_prompt, user_message)."""
+def build_messages(question: str, sources: list[Source],
+                   guidance: str | None = None) -> tuple[str, str]:
+    """Returns (system_prompt, user_message). `guidance` is optional extra context that is
+    placed before the question (used by the ContractNLI benchmark, see eval/fewshot.py)."""
+    extra = f"<guidance>\n{guidance}\n</guidance>\n\n" if guidance else ""
     user = (f"<sources>\n{format_sources(sources)}\n</sources>\n\n"
-            f"Question: {question}")
+            f"{extra}Question: {question}")
     return SYSTEM_PROMPT, user

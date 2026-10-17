@@ -11,6 +11,14 @@ qa.py  —  Pipeline B: question -> retrieve -> prompt -> LLM -> checked answer 
 Whole-contract mode (whole_doc_tokens > 0): if the whole document is shorter than that many
 tokens, the LLM gets EVERY chunk instead of the top-k. Nothing can be missed by search, and
 exceptions written in other clauses are visible too. Long documents still use search.
+
+Follow-up for "not mentioned" answers (followup="more" or "whole"):
+  "The top-5 clauses don't mention it" is not the same as "the contract doesn't mention it".
+  When the first answer says the document doesn't address the question (or is empty), we look
+  again before giving up:
+    more  : the NEXT clauses in the ranking (6..followup_k) are sent in a second call
+    whole : the rest of the contract (every clause not shown yet) is sent in a second call
+  Answer.not_found_scope then says how much was checked: "top_k", "more_clauses" or "document".
 """
 from __future__ import annotations
 
@@ -37,6 +45,9 @@ class Answer:
     raw_llm_output: str = ""
     candidates: list[Source] = field(default_factory=list)  # all top-k, before the cut-off
     timings: dict = field(default_factory=dict)             # seconds per step
+    followup: str | None = None          # None, or "more"/"whole" if a second look was taken
+    first_text: str | None = None        # the answer before the follow-up
+    not_found_scope: str | None = None   # for "not mentioned": "top_k", "more_clauses", "document"
 
 
 def _process_citations(raw: str, sources: list[Source]) -> tuple[str, list[Source], list[str]]:
@@ -67,13 +78,67 @@ def _approx_tokens(text: str) -> int:
     return int(len(text.split()) * 1.3) + 1
 
 
-def answer_question(question: str, retriever: Retriever, llm: LLM,
-                    doc_id: str | None = None, whole_doc_tokens: int = 0) -> Answer:
+_NOT_MENTIONED_OPENINGS = ("the document doesn't say", "the document does not say",
+                           "i couldn't find", "i could not find")
+
+
+def says_not_mentioned(answer: Answer) -> bool:
+    """True if the answer is a 'not in the document' answer (or empty)."""
+    if not answer.found:
+        return True
+    t = re.sub(r"^[\s*_#>\-]+", "", answer.text or "").lower().replace("’", "'")
+    return t.startswith(_NOT_MENTIONED_OPENINGS)
+
+
+def _relabel(sources: list[Source]) -> list[Source]:
+    return [Source(**{**s.__dict__, "label": f"S{i}"}) for i, s in enumerate(sources, start=1)]
+
+
+def answer_question(question: str, retriever: Retriever, llm: LLM, doc_id: str | None = None,
+                    whole_doc_tokens: int = 0, followup: str = "none", followup_k: int = 15,
+                    guidance: str | None = None) -> Answer:
+    first = _answer_once(question, retriever, llm, doc_id, whole_doc_tokens, guidance=guidance)
+    if followup == "none" or not doc_id or not says_not_mentioned(first):
+        if says_not_mentioned(first):
+            first.not_found_scope = "document" if first.timings.get("whole_doc") else "top_k"
+        return first
+
+    # second look: clauses the model has NOT seen yet
+    t0 = time.perf_counter()
+    seen = {s.chunk_id for s in first.retrieved}
+    if followup == "whole":
+        extra = [s for s in retriever.all_chunks(doc_id) if s.chunk_id not in seen]
+        scope = "document"
+    else:
+        extra = [s for s in retriever.search(question, doc_id=doc_id, k=followup_k) if s.chunk_id not in seen]
+        scope = "more_clauses"
+    if not extra:
+        first.not_found_scope = scope
+        return first
+    second = _answer_once(question, retriever, llm, doc_id, 0, sources=_relabel(extra), guidance=guidance)
+    second.timings["retrieval"] = first.timings.get("retrieval", 0) + second.timings.get("retrieval", 0)
+    second.timings["llm"] = first.timings.get("llm", 0) + second.timings.get("llm", 0)
+    second.timings["followup"] = time.perf_counter() - t0
+    second.followup, second.first_text = followup, first.text
+    second.candidates = first.candidates
+    if says_not_mentioned(second):              # still nothing: keep the first answer, but now
+        first.followup, first.first_text = followup, first.text      # we know the wider scope
+        first.not_found_scope, first.timings = scope, second.timings
+        return first
+    return second                               # the second look found an answer
+
+
+def _answer_once(question: str, retriever: Retriever, llm: LLM, doc_id: str | None,
+                 whole_doc_tokens: int, sources: list[Source] | None = None,
+                 guidance: str | None = None) -> Answer:
     question = question.strip()
     t0 = time.perf_counter()
-    candidates = retriever.search(question, doc_id=doc_id)    # search ONCE ...
-    sources = retriever.filter(candidates)                     # ... then apply the cut-off
-    whole = False
+    if sources is not None:                                    # follow-up: sources given
+        candidates, whole = sources, False
+    else:
+        candidates = retriever.search(question, doc_id=doc_id)    # search ONCE ...
+        sources = retriever.filter(candidates)                     # ... then apply the cut-off
+        whole = False
     if whole_doc_tokens and doc_id:
         everything = retriever.all_chunks(doc_id)
         if everything and sum(_approx_tokens(s.text) for s in everything) <= whole_doc_tokens:
@@ -84,7 +149,7 @@ def answer_question(question: str, retriever: Retriever, llm: LLM,
         return Answer(question, NOT_FOUND, found=False, candidates=candidates, timings=timings,
                       warnings=["No clause scored above the minimum similarity."])
 
-    system, user = build_messages(question, sources)
+    system, user = build_messages(question, sources, guidance)
     t1 = time.perf_counter()
     raw = llm.complete(system, user)
     if not raw.strip():                        # reasoning models can run out of tokens
