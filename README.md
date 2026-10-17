@@ -9,6 +9,9 @@ highlighted, so every answer can be checked in seconds.
 **Live demo:** [Legal Document Navigator](https://legaldocumentnavigator.streamlit.app/)
 
 
+<img width="1479" height="838" alt="Screenshot 2026-10-17 at 23 01 17" src="https://github.com/user-attachments/assets/e35dabd0-a994-4661-995a-4ac4bdea9a61" />
+
+
 ## Results at a glance
 
 Evaluated on **ContractNLI**, real NDAs labelled by lawyers. The pipeline is the same in every
