@@ -1,15 +1,13 @@
 # ⚖️ Legal Document Navigator
 
-Upload a contract (PDF), ask questions in plain language, and get short answers that cite the
+Upload some legal document or contract (PDF), ask questions in plain language, and get short answers in plain language that cite the
 exact clause. The PDF opens next to the chat and the sentences the answer relied on are
 highlighted, so every answer can be checked in seconds.
 
 > This tool explains documents. It is not legal advice.
 
-**Live demo:** _add your Streamlit Cloud link here_
+**Live demo:** [Legal Document Navigator](https://legaldocumentnavigator.streamlit.app/)
 
-<!-- Add a screenshot: save it as docs/screenshot.png and uncomment the line below -->
-<!-- ![screenshot](docs/screenshot.png) -->
 
 ## Results at a glance
 
@@ -47,6 +45,9 @@ The paper reports the full test split. Details and caveats are under [Evaluation
   and error analysis.
 
 ## How it works
+
+<img width="1418" height="961" alt="image" src="https://github.com/user-attachments/assets/22bd2692-1ac9-4b2e-bf2e-fc635fc35a6b" />
+
 
 ```
 ingestion (once per PDF)
